@@ -1,0 +1,7 @@
+#ifndef CHAT_CLIENT_TRAFFIC_SETTING_H
+#define CHAT_CLIENT_TRAFFIC_SETTING_H
+
+static const int MAX_ROOM = 100;
+static const int MAX_USER = 100;
+
+#endif //CHAT_CLIENT_TRAFFIC_SETTING_H
