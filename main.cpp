@@ -12,7 +12,6 @@
 #include "system_message.h"
 #include "system_type.h"
 #include "ThreadPool.h"
-#include "MessageFromClient.h"
 
 #define JSON 0
 #define PROTOBUF 1
@@ -23,11 +22,24 @@ void respond(int clientSock, const std::string &ip, int port);
 
 int messageFormat(const char *buf);
 
-void sendMessageToClient(const json &jsonData, int clientSock);
+void sendMessageToClient(const std::string &respData, int clientSock);
+
+void sendMessageToOtherClient(std::string &respData, User *client);
 
 std::vector<ChatRoom *> chatRooms;
 
 std::vector<uint8_t> getMessageLengthBytes(std::size_t messageLength);
+
+std::string toSystemMessage(std::string message);
+
+std::string toChattingMessage(std::string name, std::string &text);
+
+std::string toRoomsResultMessage();
+
+std::string convertJsonToMessage(const json &jsonData);
+
+ChatRoom *findChatRoom(const int &roomId);
+
 
 int main() {
     int passiveSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -36,7 +48,7 @@ int main() {
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
     sin.sin_addr.s_addr = INADDR_ANY;
-    sin.sin_port = htons(9120);
+    sin.sin_port = htons(9119);
     if (bind(passiveSock, (struct sockaddr *) &sin, sizeof(sin)) < 0) {
         std::cerr << "bind() failed: " << strerror(errno) << std::endl;
         return 1;
@@ -66,11 +78,10 @@ int main() {
 }
 
 void respond(int clientSock, const std::string &ip, int port) {
-    while (1) {
-        std::cout << "respond 접근" << std::endl;
+    std::cout << "respond 접근" << std::endl;
+    User *client = new User(clientSock, "(" + ip + ", " + std::to_string(port) + ")");
+    while (true) {
         char buf[65536];
-
-        User *client = new User(clientSock, "(" + ip + ", " + std::to_string(port) + ")");
         int numRecv = recv(clientSock, buf, sizeof(buf), 0);
         std::string trimBuf(buf + 2, numRecv - 2);
         std::cout << "Recv: " << numRecv << std::endl;
@@ -89,254 +100,95 @@ void respond(int clientSock, const std::string &ip, int port) {
                     std::cout << "/name 접근" << std::endl;
                     ChatRoom *currentRoom = client->getChatRoom();
 
-                    //json 변환
-                    std::cout << "json 변환 접근" << std::endl;
-                    client->setNickname(jsonMessage["name"]);
-                    std::string respMessage = CHANGE_NAME(client->getNickname());
-                    json jsonData;
-                    jsonData["type"] = "SCSystemMessage";
-                    jsonData["text"] = respMessage;
-
-                    //json 보낼 준비
-                    std::cout << "json 보낼 준비 접근" << std::endl;
-                    std::string serializedData = jsonData.dump();
-                    std::string respData;
-                    const auto dataSize = serializedData.size();
-                    auto messageBytes = getMessageLengthBytes(dataSize);
-                    for (auto byte: messageBytes) {
-                        respData += byte;
-                    }
-                    respData += serializedData;
-                    const char *respBuf = respData.c_str();
-                    int offset = 0;
-
-                    //일단 나한테 보냄
-                    std::cout << "보내기 접근" << std::endl;
-                    std::cout << "respData: " << respData << std::endl;
-                    while (offset < respData.size()) {
-                        int numSend = send(clientSock, respBuf + offset, respData.size() - offset, 0);
-                        if (respData.empty()) {
-                            std::cerr << "send() failed: " << strerror(errno) << std::endl;
-                        } else {
-                            std::cout << "Sent: " << numSend << std::endl;
-                            offset += numSend;
-                        }
-                    }
-
+                    client->setNickname(jsonMessage["name"]);   //client의 name 재설정
+                    //보낼 메시지 생성
+                    auto respData = toSystemMessage(CHANGE_NAME(client->getNickname()));
+                    //나에게 전송
+                    sendMessageToClient(respData, clientSock);
                     //모두에게 전송
-                    if (currentRoom != nullptr) {
-                        for (User *user: currentRoom->getUser()) {
-                            int otherClientSock = user->getSock();
-                            while (offset < respData.size()) {
-                                int numSend = send(otherClientSock, respBuf + offset, respData.size() - offset, 0);
-                                if (respData.empty()) {
-                                    std::cerr << "send() failed: " << strerror(errno) << std::endl;
-                                } else {
-                                    std::cout << "Sent: " << numSend << std::endl;
-                                    offset += numSend;
-                                }
-                            }
-                        }
-                    }
+                    if (currentRoom != nullptr) sendMessageToOtherClient(respData, client);
+
                 } else if (type == CS_ROOMS) {
-
-                    json jsonData;
+                    std::cout << "/room 접근" << std::endl;
+                    std::string respData;
                     if (chatRooms.empty()) {
-                        std::string respMessage = NO_CHATROOM_ERROR;
-                        jsonData = {
-                                {"text", respMessage}
-                        };
+                        respData = toSystemMessage(NO_CHATROOM_ERROR);
                     } else {
-                        //json 변환
-                        jsonData = json::array();
-                        jsonData["rooms"] = json::array();
-                        for (ChatRoom *room: chatRooms) {
-                            json jsonRoom;
-                            jsonRoom["roomId"] = room->getRoomNum();
-                            jsonRoom["title"] = room->getTitle();
-                            jsonRoom["members"] = json::array();
-                            for (User *user: room->getUser()) {
-                                jsonRoom["members"].push_back(user->getNickname());
-                            }
-                            jsonData["rooms"].push_back(jsonRoom);
-                        }
+                        respData = toRoomsResultMessage();
+                        std::cout << respData << std::endl;
                     }
-
-                    sendMessageToClient(jsonData, clientSock);
-
+                    sendMessageToClient(respData, clientSock);
                 } else if (type == CS_CREATE_ROOM) {
-                    json jsonData;
+                    std::cout << "/create 접근" << std::endl;
                     ChatRoom *currentRoom = client->getChatRoom();
-                    if (currentRoom != nullptr) {
-                        std::string respMessage = CREATE_CHATROOM_ERROR;
-                        jsonData = {
-                                {"text", respMessage}
-                        };
+                    std::string respData;
+                    if (currentRoom != nullptr) {   //현재 참여중인 방이 있을 경우
+                        respData = toSystemMessage(CREATE_CHATROOM_ERROR);
                     } else {
                         //chatRoom 생성 및 입장
                         std::string roomTitle = jsonMessage["title"];
-                        auto *room = new ChatRoom(roomTitle, clientSock);
-                        room->setUser(client);
-
-                        //json 변환
-                        std::string respMessage = JOIN_NOTIFYING_ME(roomTitle);
-                        jsonData = {
-                                {"text", respMessage}
-                        };
+                        chatRooms.emplace_back(new ChatRoom(roomTitle, clientSock, client));    //방 생성 & 방에 입장시키ㅣㄱ
+                        respData = toSystemMessage(JOIN_NOTIFYING_ME(roomTitle));
                     }
-
-                    sendMessageToClient(jsonData, clientSock);
+                    sendMessageToClient(respData, clientSock);
 
                 } else if (type == CS_JOIN_ROOM) {
+                    std::cout << "/join 접근" << std::endl;
+                    std::string respData;
                     json jsonData;
                     ChatRoom *currentRoom = client->getChatRoom();
                     if (currentRoom != nullptr) {
-                        std::string respMessage = CHATROOM_ALREADY_JOINED_ERROR;
-                        jsonData = {
-                                {"text", respMessage}
-                        };
-                        sendMessageToClient(jsonData, clientSock);
+                        respData = toSystemMessage(CHATROOM_ALREADY_JOINED_ERROR);
+                        sendMessageToClient(respData, clientSock);
                     } else {
-                        bool isRoom = false;
-                        for (auto chatRoom: chatRooms) {
-                            if (jsonMessage["roomId"] == chatRoom->getRoomNum()) {
-                                isRoom = true;
-                                currentRoom = chatRoom;
-                                break;
-                            }
-                        }
-                        if (!isRoom) {
-                            std::string respMessage = NOT_FOUND_CHATROOM_ERROR;
-                            jsonData = {
-                                    {"text", respMessage}
-                            };
-                            sendMessageToClient(jsonData, clientSock);
+                        ChatRoom *findRoom = findChatRoom(jsonMessage["roomId"]);
+                        if (findRoom == nullptr) {
+                            respData = toSystemMessage(NOT_FOUND_CHATROOM_ERROR);
+                            sendMessageToClient(respData, clientSock);
                         } else {
-                            std::string respMessage = JOIN_NOTIFYING_ME(currentRoom->getTitle());
-                            jsonData = {
-                                    {"text", respMessage}
-                            };
-
-                            sendMessageToClient(jsonData, clientSock);
-
-                            respMessage = JOIN_NOTIFYING_OTHER(client->getNickname());
-                            jsonData = {
-                                    {"text", respMessage}
-                            };
-
-                            //json 보낼 준비
-                            std::string respData = jsonData.dump();
-                            const char *respBuf = respData.c_str();
-                            int offset = 0;
-
-                            //나빼고 모두에게 전송
-                            for (User *user: currentRoom->getUser()) {
-                                if (user != client) {
-                                    int otherClientSock = user->getSock();
-                                    while (offset < respData.size()) {
-                                        int numSend = send(otherClientSock, respBuf + offset,
-                                                           respData.size() - offset,
-                                                           0);
-                                        if (respData.empty()) {
-                                            std::cerr << "send() failed: " << strerror(errno) << std::endl;
-                                        } else {
-                                            std::cout << "Sent: " << numSend << std::endl;
-                                            offset += numSend;
-                                        }
-                                    }
-                                }
-                            }
+                            findRoom->setUser(client);   //방 입장
+                            //나에게 보내기
+                            respData = toSystemMessage(JOIN_NOTIFYING_ME(findRoom->getTitle()));
+                            sendMessageToClient(respData, clientSock);
+                            //나머지에게 보내기
+                            respData = toSystemMessage(JOIN_NOTIFYING_OTHER(client->getNickname()));
+                            sendMessageToOtherClient(respData, client);
                         }
                     }
+
                 } else if (type == CS_LEAVE_ROOM) {
-                    //대화방을 나가는 명령어입니다.
+                    std::cout << "/leave 접근" << std::endl;
                     json jsonData;
+                    std::string respData;
                     ChatRoom *currentRoom = client->getChatRoom();
-                    //대화방에 참여 중이지 않을 때 서버는 [시스템 메시지] 현재 대화방에 들어가 있지 않습니다. 메시지를 해당 유저에게 전송해야 됩니다.
                     if (currentRoom == nullptr) {
-                        std::string respMessage = LEAVE_CHATROOM_ERROR;
-                        jsonData = {
-                                {"text", respMessage}
-                        };
-                        sendMessageToClient(jsonData, clientSock);
-                        //나간 유저 본인에게는 [시스템 메시지] 방제[hello world] 대화 방에서 퇴장했습니다. 와 같은 메시지를 전송해야 됩니다.
+                        respData = toSystemMessage(LEAVE_CHATROOM_ERROR);
+                        sendMessageToClient(respData, clientSock);
                     } else {
-                        client->leaveChatRoom();
-                        std::string respMessage = LEAVE_NOTIFYING_ME(currentRoom->getTitle());
-                        jsonData = {
-                                {"text", respMessage}
-                        };
-                        sendMessageToClient(jsonData, clientSock);
-
-                        respMessage = LEAVE_NOTIFYING_OTHER(client->getNickname());
-                        jsonData = {
-                                {"text", respMessage}
-                        };
-
-                        //json 보낼 준비
-                        std::string respData = jsonData.dump();
-                        const char *respBuf = respData.c_str();
-                        int offset = 0;
-
-                        //나빼고 모두에게 전송
-                        for (User *user: currentRoom->getUser()) {
-                            if (user != client) {
-                                int otherClientSock = user->getSock();
-                                while (offset < respData.size()) {
-                                    int numSend = send(otherClientSock, respBuf + offset,
-                                                       respData.size() - offset,
-                                                       0);
-                                    if (respData.empty()) {
-                                        std::cerr << "send() failed: " << strerror(errno) << std::endl;
-                                    } else {
-                                        std::cout << "Sent: " << numSend << std::endl;
-                                        offset += numSend;
-                                    }
-                                }
-                            }
-                        }
+                        //나에게 보내기
+                        respData = toSystemMessage(LEAVE_NOTIFYING_ME(currentRoom->getTitle()));
+                        sendMessageToClient(respData, clientSock);
+                        //나머지에게 보내기
+                        respData = toSystemMessage(LEAVE_NOTIFYING_OTHER(client->getNickname()));
+                        sendMessageToOtherClient(respData, client);
+                        client->leaveChatRoom();    //방에서 나가기
                     }
                 } else if (type == CS_SHUTDOWN) {
+                    shutdown(clientSock, SHUT_RDWR);
                     close(clientSock);
                     return;
                 } else if (type == CS_CHAT) {
+                    std::cout << "chat 접근" << std::endl;
                     json jsonData;
+                    std::string respData;
                     ChatRoom *currentRoom = client->getChatRoom();
                     if (currentRoom == nullptr) {
-                        std::string respMessage = NOT_JOINED_CHATROOM_ERROR;
-                        jsonData = {
-                                {"text", respMessage}
-                        };
-                        sendMessageToClient(jsonData, clientSock);
+                        respData = toSystemMessage(NOT_JOINED_CHATROOM_ERROR);
+                        sendMessageToClient(respData, clientSock);
                     } else {
                         std::string respMessage = jsonMessage["text"];
-                        jsonData = {
-                                {"member", client->getNickname()},
-                                {"text",   respMessage}
-                        };
-
-                        //json 보낼 준비
-                        std::string respData = jsonData.dump();
-                        const char *respBuf = respData.c_str();
-                        int offset = 0;
-
-                        //나빼고 모두에게 전송
-                        for (User *user: currentRoom->getUser()) {
-                            if (user != client) {
-                                int otherClientSock = user->getSock();
-                                while (offset < respData.size()) {
-                                    int numSend = send(otherClientSock, respBuf + offset,
-                                                       respData.size() - offset,
-                                                       0);
-                                    if (respData.empty()) {
-                                        std::cerr << "send() failed: " << strerror(errno) << std::endl;
-                                    } else {
-                                        std::cout << "Sent: " << numSend << std::endl;
-                                        offset += numSend;
-                                    }
-                                }
-                            }
-                        }
+                        respData = toChattingMessage(client->getNickname(), respMessage);
+                        sendMessageToOtherClient(respData, client);
                     }
                 } else {
                     //TODO:: ERROR HANDLER 필요
@@ -344,7 +196,6 @@ void respond(int clientSock, const std::string &ip, int port) {
                 break;
         }
     }
-
 }
 
 int messageFormat(const char *buf) {
@@ -352,9 +203,9 @@ int messageFormat(const char *buf) {
     return PROTOBUF;
 }
 
-void sendMessageToClient(const json &jsonData, int clientSock) {
+//클라이언트한테 메시지 보내기
+void sendMessageToClient(const std::string &respData, int clientSock) {
     //json 보낼 준비
-    std::string respData = jsonData.dump();
     const char *respBuf = respData.c_str();
     int offset = 0;
 
@@ -370,6 +221,16 @@ void sendMessageToClient(const json &jsonData, int clientSock) {
     }
 }
 
+//나를 제외한 클라이언트에게 메시지 보내기
+void sendMessageToOtherClient(std::string &respData, User *client) {
+    ChatRoom *currentRoom = client->getChatRoom();
+    for (auto user: currentRoom->getUser()) {
+        if (user->getSock() != client->getSock()) {
+            sendMessageToClient(respData, user->getSock());
+        }
+    }
+}
+
 // 메시지의 길이를 2바이트로 변환하여 반환하는 함수
 std::vector<uint8_t> getMessageLengthBytes(std::size_t messageLength) {
     std::vector<uint8_t> result(2);
@@ -380,3 +241,65 @@ std::vector<uint8_t> getMessageLengthBytes(std::size_t messageLength) {
 
     return result;
 }
+
+// 시스템 메시지 만들기
+std::string toSystemMessage(std::string message) {
+    json jsonData = {{"type", SC_SYSTEM_MESSAGE},
+                     {"text", message}};
+
+    return convertJsonToMessage(jsonData);
+}
+
+// 채팅 메시지 만들기
+std::string toChattingMessage(std::string name, std::string &text) {
+    json jsonData = {{"type",   SC_CHAT},
+                     {"member", name},
+                     {"text",   text}};
+
+    return convertJsonToMessage(jsonData);
+}
+
+std::string toRoomsResultMessage() {
+    json jsonData;
+    jsonData["type"] = SC_ROOMS_RESULT;
+    jsonData["rooms"] = json::array();
+    for (ChatRoom *room: chatRooms) {
+        json jsonRoom;
+        jsonRoom["roomId"] = room->getRoomNum();
+        jsonRoom["title"] = room->getTitle();
+        jsonRoom["members"] = json::array();
+        for (User *user: room->getUser()) {
+            jsonRoom["members"].push_back(user->getNickname());
+        }
+        jsonData["rooms"].push_back(jsonRoom);
+    }
+
+    return convertJsonToMessage(jsonData);
+}
+
+// json 을 message 로
+std::string convertJsonToMessage(const json &jsonData) {
+    std::string serializedData = jsonData.dump();
+    std::size_t messageLength = serializedData.size();
+    auto messageBytes = getMessageLengthBytes(messageLength);
+    std::string message;
+    for (auto byte: messageBytes) {
+        message += byte;
+    }
+    message += serializedData;
+    return message;
+}
+
+//방 찾기
+ChatRoom *findChatRoom(const int &roomId) {
+    bool isRoom = false;
+    for (auto chatRoom: chatRooms) {
+        if (roomId == chatRoom->getRoomNum()) {
+            isRoom = true;
+            return chatRoom;
+        }
+    }
+    return nullptr;
+}
+
+
