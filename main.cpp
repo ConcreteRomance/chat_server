@@ -18,15 +18,13 @@
 
 using namespace nlohmann;
 
-void respond(int clientSock, const std::string &ip, int port);
+void respond(int clientSock, int passiveSock, const std::string &ip, int port);
 
 int messageFormat(const char *buf);
 
 void sendMessageToClient(const std::string &respData, int clientSock);
 
 void sendMessageToOtherClient(std::string &respData, User *client);
-
-std::vector<ChatRoom *> chatRooms;
 
 std::vector<uint8_t> getMessageLengthBytes(std::size_t messageLength);
 
@@ -40,6 +38,11 @@ std::string convertJsonToMessage(const json &jsonData);
 
 ChatRoom *findChatRoom(const int &roomId);
 
+void deleteRoom(ChatRoom* currentRoom);
+
+std::vector<ChatRoom *> chatRooms;
+
+std::vector<int> clientSocks;
 
 int main() {
     int passiveSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -70,14 +73,14 @@ int main() {
             std::cerr << "accept() failed: " << strerror(errno) << std::endl;
             return 1;
         }
-        pool.enqueue([clientSock, sin] {
-            respond(clientSock, inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
+        clientSocks.emplace_back(clientSock);
+        pool.enqueue([clientSock, passiveSock, sin] {
+            respond(clientSock, passiveSock, inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
         });
     }
-    close(passiveSock);
 }
 
-void respond(int clientSock, const std::string &ip, int port) {
+void respond(int clientSock, int passiveSock, const std::string &ip, int port) {
     std::cout << "respond 접근" << std::endl;
     User *client = new User(clientSock, "(" + ip + ", " + std::to_string(port) + ")");
     while (true) {
@@ -172,11 +175,14 @@ void respond(int clientSock, const std::string &ip, int port) {
                         respData = toSystemMessage(LEAVE_NOTIFYING_OTHER(client->getNickname()));
                         sendMessageToOtherClient(respData, client);
                         client->leaveChatRoom();    //방에서 나가기
+                        if (currentRoom->getUser().empty())     deleteRoom(currentRoom);
                     }
                 } else if (type == CS_SHUTDOWN) {
-                    shutdown(clientSock, SHUT_RDWR);
-                    close(clientSock);
-                    return;
+                    for (auto sock: clientSocks) {
+                        close(sock);
+                    }
+                    close(passiveSock);
+                    exit(0);
                 } else if (type == CS_CHAT) {
                     std::cout << "chat 접근" << std::endl;
                     json jsonData;
@@ -300,6 +306,17 @@ ChatRoom *findChatRoom(const int &roomId) {
         }
     }
     return nullptr;
+}
+
+//방 삭제
+void deleteRoom(ChatRoom* currentRoom){
+    for (int i = 0; i < chatRooms.size(); i++) {
+        if (chatRooms[i] == currentRoom) {
+            chatRooms.erase(chatRooms.begin() + i, chatRooms.begin() + i + 1);
+            break;
+        }
+    }
+    delete currentRoom;
 }
 
 
