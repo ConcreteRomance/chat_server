@@ -5,7 +5,9 @@
 
 #include <iostream>
 #include <unistd.h>
+#include <set>
 #include <nlohmann/json.hpp>
+#include <utility>
 
 #include "User.h"
 #include "ChatRoom.h"
@@ -38,13 +40,61 @@ std::string convertJsonToMessage(const json &jsonData);
 
 ChatRoom *findChatRoom(const int &roomId);
 
-void deleteRoom(ChatRoom* currentRoom);
+void deleteRoom(ChatRoom *currentRoom);
 
 std::vector<ChatRoom *> chatRooms;
 
-std::vector<int> clientSocks;
+std::set<int> clientSocks;
+
+class AppMessage {
+public:
+    AppMessage(User *user, json jsonMessage, int clientSock, int passiveSock) {
+        user_ = user;
+        jsonMessage_ = std::move(jsonMessage);
+        clientSock_ = clientSock;
+    };
+
+    User *user_;
+    json jsonMessage_;
+    int clientSock_;
+    int passiveSock_;
+};
+
+typedef std::string MessageType;
+
+typedef void (*MessageHandler)(const AppMessage *);
+
+typedef std::map<MessageType, MessageHandler> HandlerMap;
+
+void onName(const AppMessage *msg);
+
+void onCreateRoom(const AppMessage *msg);
+
+void onChat(const AppMessage *msg);
+
+void onShutDown(const AppMessage *msg);
+
+void onLeaveRoom(const AppMessage *msg);
+
+void onJoinRoom(const AppMessage *msg);
+
+void onRooms(const AppMessage *msg);
+
+static HandlerMap handlers{
+        {CS_NAME,        onName},
+        {CS_CREATE_ROOM, onCreateRoom},
+        {CS_CHAT,        onChat},
+        {CS_SHUTDOWN,    onShutDown},
+        {CS_LEAVE_ROOM,  onLeaveRoom},
+        {CS_JOIN_ROOM,   onJoinRoom},
+        {CS_ROOMS,       onRooms},
+};
 
 int main() {
+    int numWorkThread = 100;
+    std::cout << "Work Thread 개수를 지정해주세요(default = 100): " << std::endl;
+    std::cin >> numWorkThread;
+
     int passiveSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
     struct sockaddr_in sin{};
@@ -57,26 +107,53 @@ int main() {
         return 1;
     }
 
+    std::cout << "Socket Binding Complete!" << std::endl;
+
     if (listen(passiveSock, 10) < 0) {
         std::cerr << "listen() failed: " << strerror(errno) << std::endl;
         return 1;
     }
 
+    std::cout << "Listening.." << std::endl;
+
     memset(&sin, 0, sizeof(sin));
     unsigned int sin_len = sizeof(sin);
 
-    ThreadPool pool(100);
+    ThreadPool pool(numWorkThread);
 
     while (true) {
-        int clientSock = accept(passiveSock, (struct sockaddr *) &sin, &sin_len);
-        if (clientSock < 0) {
-            std::cerr << "accept() failed: " << strerror(errno) << std::endl;
-            return 1;
+        fd_set rset;
+        FD_ZERO(&rset);
+
+        FD_SET(passiveSock, &rset);
+        int maxFd = passiveSock;
+
+        for (auto sock: clientSocks) {
+            FD_SET(sock, &rset);
+            if (sock > maxFd) maxFd = sock;
         }
-        clientSocks.emplace_back(clientSock);
-        pool.enqueue([clientSock, passiveSock, sin] {
-            respond(clientSock, passiveSock, inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
-        });
+
+        int numReady = select(maxFd + 1, &rset, nullptr, nullptr, nullptr);
+        if (numReady < 0) {
+            std::cerr << "select() failed: " << strerror(errno) << std::endl;
+            continue;
+        } else if (numReady == 0) {
+            continue;
+        }
+
+        if (FD_ISSET(passiveSock, &rset)) {
+            memset(&sin, 0, sizeof(sin));
+            unsigned int sin_len = sizeof(sin);
+            int clientSock = accept(passiveSock, (struct sockaddr *) &sin, &sin_len);
+            if (clientSock < 0) {
+                std::cerr << "accept() failed: " << strerror(errno) << std::endl;
+            } else {
+                clientSocks.insert(clientSock);
+            }
+            pool.enqueue([clientSock, passiveSock, sin] {
+                respond(clientSock, passiveSock, inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
+            });
+        }
     }
 }
 
@@ -99,109 +176,150 @@ void respond(int clientSock, int passiveSock, const std::string &ip, int port) {
                 std::string type = jsonMessage["type"];
                 std::cout << "type: " << type << std::endl;
 
-                if (type == CS_NAME) {
-                    std::cout << "/name 접근" << std::endl;
-                    ChatRoom *currentRoom = client->getChatRoom();
+                auto *msg = new AppMessage(client, jsonMessage, clientSock, passiveSock);
 
-                    client->setNickname(jsonMessage["name"]);   //client의 name 재설정
-                    //보낼 메시지 생성
-                    auto respData = toSystemMessage(CHANGE_NAME(client->getNickname()));
-                    //나에게 전송
-                    sendMessageToClient(respData, clientSock);
-                    //모두에게 전송
-                    if (currentRoom != nullptr) sendMessageToOtherClient(respData, client);
-
-                } else if (type == CS_ROOMS) {
-                    std::cout << "/room 접근" << std::endl;
-                    std::string respData;
-                    if (chatRooms.empty()) {
-                        respData = toSystemMessage(NO_CHATROOM_ERROR);
-                    } else {
-                        respData = toRoomsResultMessage();
-                        std::cout << respData << std::endl;
-                    }
-                    sendMessageToClient(respData, clientSock);
-                } else if (type == CS_CREATE_ROOM) {
-                    std::cout << "/create 접근" << std::endl;
-                    ChatRoom *currentRoom = client->getChatRoom();
-                    std::string respData;
-                    if (currentRoom != nullptr) {   //현재 참여중인 방이 있을 경우
-                        respData = toSystemMessage(CREATE_CHATROOM_ERROR);
-                    } else {
-                        //chatRoom 생성 및 입장
-                        std::string roomTitle = jsonMessage["title"];
-                        chatRooms.emplace_back(new ChatRoom(roomTitle, clientSock, client));    //방 생성 & 방에 입장시키ㅣㄱ
-                        respData = toSystemMessage(JOIN_NOTIFYING_ME(roomTitle));
-                    }
-                    sendMessageToClient(respData, clientSock);
-
-                } else if (type == CS_JOIN_ROOM) {
-                    std::cout << "/join 접근" << std::endl;
-                    std::string respData;
-                    json jsonData;
-                    ChatRoom *currentRoom = client->getChatRoom();
-                    if (currentRoom != nullptr) {
-                        respData = toSystemMessage(CHATROOM_ALREADY_JOINED_ERROR);
-                        sendMessageToClient(respData, clientSock);
-                    } else {
-                        ChatRoom *findRoom = findChatRoom(jsonMessage["roomId"]);
-                        if (findRoom == nullptr) {
-                            respData = toSystemMessage(NOT_FOUND_CHATROOM_ERROR);
-                            sendMessageToClient(respData, clientSock);
-                        } else {
-                            findRoom->setUser(client);   //방 입장
-                            //나에게 보내기
-                            respData = toSystemMessage(JOIN_NOTIFYING_ME(findRoom->getTitle()));
-                            sendMessageToClient(respData, clientSock);
-                            //나머지에게 보내기
-                            respData = toSystemMessage(JOIN_NOTIFYING_OTHER(client->getNickname()));
-                            sendMessageToOtherClient(respData, client);
-                        }
-                    }
-
-                } else if (type == CS_LEAVE_ROOM) {
-                    std::cout << "/leave 접근" << std::endl;
-                    json jsonData;
-                    std::string respData;
-                    ChatRoom *currentRoom = client->getChatRoom();
-                    if (currentRoom == nullptr) {
-                        respData = toSystemMessage(LEAVE_CHATROOM_ERROR);
-                        sendMessageToClient(respData, clientSock);
-                    } else {
-                        //나에게 보내기
-                        respData = toSystemMessage(LEAVE_NOTIFYING_ME(currentRoom->getTitle()));
-                        sendMessageToClient(respData, clientSock);
-                        //나머지에게 보내기
-                        respData = toSystemMessage(LEAVE_NOTIFYING_OTHER(client->getNickname()));
-                        sendMessageToOtherClient(respData, client);
-                        client->leaveChatRoom();    //방에서 나가기
-                        if (currentRoom->getUser().empty())     deleteRoom(currentRoom);
-                    }
-                } else if (type == CS_SHUTDOWN) {
-                    for (auto sock: clientSocks) {
-                        close(sock);
-                    }
-                    close(passiveSock);
-                    exit(0);
-                } else if (type == CS_CHAT) {
-                    std::cout << "chat 접근" << std::endl;
-                    json jsonData;
-                    std::string respData;
-                    ChatRoom *currentRoom = client->getChatRoom();
-                    if (currentRoom == nullptr) {
-                        respData = toSystemMessage(NOT_JOINED_CHATROOM_ERROR);
-                        sendMessageToClient(respData, clientSock);
-                    } else {
-                        std::string respMessage = jsonMessage["text"];
-                        respData = toChattingMessage(client->getNickname(), respMessage);
-                        sendMessageToOtherClient(respData, client);
-                    }
+                if (handlers.find(type) != handlers.end()) {
+                    handlers[type](msg);
                 } else {
-                    //TODO:: ERROR HANDLER 필요
+                    std::cerr << "Invalid type: " << type << std::endl;
                 }
-                break;
         }
     }
+}
+
+void onName(const AppMessage *msg) {
+    User *client = msg->user_;
+    json jsonMessage = msg->jsonMessage_;
+    int clientSock = msg->clientSock_;
+
+    std::cout << "/name 접근" << std::endl;
+    ChatRoom *currentRoom = client->getChatRoom();
+
+    client->setNickname(jsonMessage["name"]);   //client의 name 재설정
+
+    //보낼 메시지 생성
+    auto respData = toSystemMessage(CHANGE_NAME(client->getNickname()));
+    //나에게 전송
+    sendMessageToClient(respData, clientSock);
+    //모두에게 전송
+    if (currentRoom != nullptr) sendMessageToOtherClient(respData, client);
+}
+
+void onCreateRoom(const AppMessage *msg) {
+    User *client = msg->user_;
+    json jsonMessage = msg->jsonMessage_;
+    int clientSock = msg->clientSock_;
+
+    std::cout << "/create 접근" << std::endl;
+    ChatRoom *currentRoom = client->getChatRoom();
+    std::string respData;
+    if (currentRoom != nullptr) {   //현재 참여중인 방이 있을 경우
+        respData = toSystemMessage(CREATE_CHATROOM_ERROR);
+    } else {
+        //chatRoom 생성 및 입장
+        std::string roomTitle = jsonMessage["title"];
+        chatRooms.emplace_back(new ChatRoom(roomTitle, clientSock, client));    //방 생성 & 방에 입장시키ㅣㄱ
+        respData = toSystemMessage(JOIN_NOTIFYING_ME(roomTitle));
+    }
+    sendMessageToClient(respData, clientSock);
+
+}
+
+void onChat(const AppMessage *msg) {
+    User *client = msg->user_;
+    json jsonMessage = msg->jsonMessage_;
+    int clientSock = msg->clientSock_;
+
+    std::cout << "chat 접근" << std::endl;
+    json jsonData;
+    std::string respData;
+    ChatRoom *currentRoom = client->getChatRoom();
+    if (currentRoom == nullptr) {
+        respData = toSystemMessage(NOT_JOINED_CHATROOM_ERROR);
+        sendMessageToClient(respData, clientSock);
+    } else {
+        std::string respMessage = jsonMessage["text"];
+        respData = toChattingMessage(client->getNickname(), respMessage);
+        sendMessageToOtherClient(respData, client);
+    }
+}
+
+void onShutDown(const AppMessage *msg) {
+    int passiveSock = msg->passiveSock_;
+
+    for (auto sock: clientSocks) {
+        close(sock);
+    }
+    close(passiveSock);
+    exit(0);
+}
+
+void onLeaveRoom(const AppMessage *msg) {
+    User *client = msg->user_;
+    json jsonMessage = msg->jsonMessage_;
+    int clientSock = msg->clientSock_;
+
+    std::cout << "/leave 접근" << std::endl;
+    json jsonData;
+    std::string respData;
+    ChatRoom *currentRoom = client->getChatRoom();
+    if (currentRoom == nullptr) {
+        respData = toSystemMessage(LEAVE_CHATROOM_ERROR);
+        sendMessageToClient(respData, clientSock);
+    } else {
+        //나에게 보내기
+        respData = toSystemMessage(LEAVE_NOTIFYING_ME(currentRoom->getTitle()));
+        sendMessageToClient(respData, clientSock);
+        //나머지에게 보내기
+        respData = toSystemMessage(LEAVE_NOTIFYING_OTHER(client->getNickname()));
+        sendMessageToOtherClient(respData, client);
+        client->leaveChatRoom();    //방에서 나가기
+        if (currentRoom->getUser().empty()) deleteRoom(currentRoom);
+    }
+}
+
+void onJoinRoom(const AppMessage *msg) {
+    User *client = msg->user_;
+    json jsonMessage = msg->jsonMessage_;
+    int clientSock = msg->clientSock_;
+
+    std::cout << "/join 접근" << std::endl;
+    std::string respData;
+    json jsonData;
+    ChatRoom *currentRoom = client->getChatRoom();
+    if (currentRoom != nullptr) {
+        respData = toSystemMessage(CHATROOM_ALREADY_JOINED_ERROR);
+        sendMessageToClient(respData, clientSock);
+    } else {
+        ChatRoom *findRoom = findChatRoom(jsonMessage["roomId"]);
+        if (findRoom == nullptr) {
+            respData = toSystemMessage(NOT_FOUND_CHATROOM_ERROR);
+            sendMessageToClient(respData, clientSock);
+        } else {
+            findRoom->setUser(client);   //방 입장
+            //나에게 보내기
+            respData = toSystemMessage(JOIN_NOTIFYING_ME(findRoom->getTitle()));
+            sendMessageToClient(respData, clientSock);
+            //나머지에게 보내기
+            respData = toSystemMessage(JOIN_NOTIFYING_OTHER(client->getNickname()));
+            sendMessageToOtherClient(respData, client);
+        }
+    }
+}
+
+void onRooms(const AppMessage *msg) {
+    json jsonMessage = msg->jsonMessage_;
+    int clientSock = msg->clientSock_;
+
+    std::cout << "/room 접근" << std::endl;
+    std::string respData;
+    if (chatRooms.empty()) {
+        respData = toSystemMessage(NO_CHATROOM_ERROR);
+    } else {
+        respData = toRoomsResultMessage();
+        std::cout << respData << std::endl;
+    }
+    sendMessageToClient(respData, clientSock);
 }
 
 int messageFormat(const char *buf) {
@@ -309,7 +427,7 @@ ChatRoom *findChatRoom(const int &roomId) {
 }
 
 //방 삭제
-void deleteRoom(ChatRoom* currentRoom){
+void deleteRoom(ChatRoom *currentRoom) {
     for (int i = 0; i < chatRooms.size(); i++) {
         if (chatRooms[i] == currentRoom) {
             chatRooms.erase(chatRooms.begin() + i, chatRooms.begin() + i + 1);
