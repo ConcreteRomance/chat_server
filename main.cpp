@@ -25,8 +25,9 @@ int messageFormat(const char *buf);
 
 void sendMessageToClient(const json &jsonData, int clientSock);
 
-
 std::vector<ChatRoom *> chatRooms;
+
+std::vector<uint8_t> getMessageLengthBytes(std::size_t messageLength);
 
 int main() {
     int passiveSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -35,7 +36,7 @@ int main() {
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
     sin.sin_addr.s_addr = INADDR_ANY;
-    sin.sin_port = htons(9119);
+    sin.sin_port = htons(9120);
     if (bind(passiveSock, (struct sockaddr *) &sin, sizeof(sin)) < 0) {
         std::cerr << "bind() failed: " << strerror(errno) << std::endl;
         return 1;
@@ -98,20 +99,22 @@ void respond(int clientSock, const std::string &ip, int port) {
 
                     //json 보낼 준비
                     std::cout << "json 보낼 준비 접근" << std::endl;
-                    std::string respData = ""+jsonData.dump();
-                    const char *respBuf = respData.c_str();
-                    for (int i = 0; i < respData.size(); i++) {
-                        std::cout << respBuf[i];
+                    std::string serializedData = jsonData.dump();
+                    std::string respData;
+                    const auto dataSize = serializedData.size();
+                    auto messageBytes = getMessageLengthBytes(dataSize);
+                    for (auto byte: messageBytes) {
+                        respData += byte;
                     }
-                    std::cout << std::endl;
-                    std::cout << "respData.size(): " << respData.size() << std::endl;
+                    respData += serializedData;
+                    const char *respBuf = respData.c_str();
                     int offset = 0;
 
                     //일단 나한테 보냄
                     std::cout << "보내기 접근" << std::endl;
                     std::cout << "respData: " << respData << std::endl;
-                    while (offset < respData.capacity()) {
-                        int numSend = send(clientSock, respBuf + offset, respData.capacity() - offset, 0);
+                    while (offset < respData.size()) {
+                        int numSend = send(clientSock, respBuf + offset, respData.size() - offset, 0);
                         if (respData.empty()) {
                             std::cerr << "send() failed: " << strerror(errno) << std::endl;
                         } else {
@@ -365,4 +368,15 @@ void sendMessageToClient(const json &jsonData, int clientSock) {
             offset += numSend;
         }
     }
+}
+
+// 메시지의 길이를 2바이트로 변환하여 반환하는 함수
+std::vector<uint8_t> getMessageLengthBytes(std::size_t messageLength) {
+    std::vector<uint8_t> result(2);
+
+    // 메시지 길이를 2바이트로 변환
+    result[0] = static_cast<uint8_t>((messageLength >> 8) & 0xFF);
+    result[1] = static_cast<uint8_t>(messageLength & 0xFF);
+
+    return result;
 }
